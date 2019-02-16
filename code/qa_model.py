@@ -30,10 +30,9 @@ from tensorflow.python.ops import embedding_ops
 from evaluate import exact_match_score, f1_score
 from data_batcher import get_batch_generator
 from pretty_print import print_example
-from modules import RNNEncoder, SimpleSoftmaxLayer, BasicAttn
+from modules import RNNEncoder, SimpleSoftmaxLayer, BasicAttn, BiDAF
 
 logging.basicConfig(level=logging.INFO)
-
 
 class QAModel(object):
     """Top-level Question Answering module"""
@@ -134,12 +133,18 @@ class QAModel(object):
         context_hiddens = encoder.build_graph(self.context_embs, self.context_mask) # (batch_size, context_len, hidden_size*2)
         question_hiddens = encoder.build_graph(self.qn_embs, self.qn_mask) # (batch_size, question_len, hidden_size*2)
 
-        # Use context hidden states to attend to question hidden states
-        attn_layer = BasicAttn(self.keep_prob, self.FLAGS.hidden_size*2, self.FLAGS.hidden_size*2)
-        _, attn_output = attn_layer.build_graph(question_hiddens, self.qn_mask, context_hiddens) # attn_output is shape (batch_size, context_len, hidden_size*2)
 
-        # Concat attn_output to context_hiddens to get blended_reps
-        blended_reps = tf.concat([context_hiddens, attn_output], axis=2) # (batch_size, context_len, hidden_size*4)
+        # BasicAttn
+        # Use context hidden states to attend to question hidden states
+        # attn_layer = BasicAttn(self.keep_prob, self.FLAGS.hidden_size*2, self.FLAGS.hidden_size*2)
+        # _, attn_output = attn_layer.build_graph(question_hiddens, self.qn_mask, context_hiddens) # attn_output is shape (batch_size, context_len, hidden_size*2)
+        # # Concat attn_output to context_hiddens to get blended_reps
+        # blended_reps = tf.concat([context_hiddens, attn_output], axis=2) # (batch_size, context_len, hidden_size*4)
+        
+        #BiDAF
+        attn_layer = BiDAF(self.keep_prob)
+        blended_reps = attn_layer.build_graph(question_hiddens, self.qn_mask, context_hiddens, self.context_mask) # attn_output is shape (batch_size, context_len, hidden_size*2)
+
 
         # Apply fully connected layer to each blended representation
         # Note, blended_reps_final corresponds to b' in the handout
@@ -528,3 +533,23 @@ def write_summary(value, tag, summary_writer, global_step):
     summary = tf.Summary()
     summary.value.add(tag=tag, simple_value=value)
     summary_writer.add_summary(summary, global_step)
+
+# def run_tests():
+#     FLAGS.is_test = True
+#     # Test that it works on batch size of 1.
+#     simple_test(1, [[  1.,   2.,   3.,   4.,   3.,   3.,   4.,   4.,   3.,   6.,
+#               12.,  16.,   9.,  20.,  33.,  48.],
+#             [  5.,   6.,   7.,   8.,   3.,   3.,   4.,   4.,  15.,  18.,
+#               28.,  32.,  45.,  60.,  77.,  96.],
+#             [  9.,  10.,  11.,  12.,   3.,   3.,   4.,   4.,  27.,  30.,
+#               44.,  48.,  81., 100., 121., 144.]])
+
+
+
+
+# def main(unused_argv):
+#     run_tests()
+
+
+# if __name__ == "__main__":
+#     tf.app.run()
