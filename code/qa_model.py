@@ -224,14 +224,22 @@ class QAModel(object):
         input_feed[self.ans_span] = batch.ans_span
         input_feed[self.keep_prob] = 1.0 - self.FLAGS.dropout # apply dropout
 
+
+        run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+        run_metadata = tf.RunMetadata()
+
         # output_feed contains the things we want to fetch.
         output_feed = [self.updates, self.summaries, self.loss, self.global_step, self.param_norm, self.gradient_norm]
 
         # Run the model
-        [_, summaries, loss, global_step, param_norm, gradient_norm] = session.run(output_feed, input_feed)
-
+        [_, summaries, loss, global_step, param_norm, gradient_norm] = sess.run(output_feed,
+                                                                                input_feed,
+                                                                                options=run_options,
+                                                                                run_metadata=run_metadata)
         # All summaries in the graph are added to Tensorboard
-        summary_writer.add_summary(summaries, global_step)
+        summary_writer.add_summary(summaries, 'step%d' % global_step)
+        summary_writer.add_run_metadata(run_metadata, global_step)
+
 
         return loss, global_step, param_norm, gradient_norm
 
@@ -493,7 +501,6 @@ class QAModel(object):
 
                 # Sometimes evaluate model on dev loss, train F1/EM and dev F1/EM
                 if global_step % self.FLAGS.eval_every == 0:
-
                     # Get loss for entire dev set and log to tensorboard
                     dev_loss = self.get_dev_loss(session, dev_context_path, dev_qn_path, dev_ans_path)
                     logging.info("Epoch %d, Iter %d, dev loss: %f" % (epoch, global_step, dev_loss))
