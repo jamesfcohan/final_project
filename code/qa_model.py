@@ -200,7 +200,7 @@ class QAModel(object):
             tf.summary.scalar('loss', self.loss)
 
 
-    def run_train_iter(self, session, batch, summary_writer):
+    def run_train_iter(self, session, batch, summary_writer, global_step):
         """
         This performs a single training iteration (forward pass, loss computation, backprop, parameter update)
 
@@ -224,21 +224,24 @@ class QAModel(object):
         input_feed[self.ans_span] = batch.ans_span
         input_feed[self.keep_prob] = 1.0 - self.FLAGS.dropout # apply dropout
 
-
-        run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
-        run_metadata = tf.RunMetadata()
-
         # output_feed contains the things we want to fetch.
         output_feed = [self.updates, self.summaries, self.loss, self.global_step, self.param_norm, self.gradient_norm]
 
         # Run the model
-        [_, summaries, loss, global_step, param_norm, gradient_norm] = sess.run(output_feed,
-                                                                                input_feed,
-                                                                                options=run_options,
-                                                                                run_metadata=run_metadata)
+        # Record runtime statistics every 500 steps.
+        if global_step % 500 == 0:
+            run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+            run_metadata = tf.RunMetadata()
+            [_, summaries, loss, global_step, param_norm, gradient_norm] = session.run(output_feed,
+                                                                                    input_feed,
+                                                                                    options=run_options,
+                                                                                    run_metadata=run_metadata)
+            summary_writer.add_run_metadata(run_metadata, 'step%d' % global_step)
+        else:
+            [_, summaries, loss, global_step, param_norm, gradient_norm] = session.run(output_feed, input_feed)
+
         # All summaries in the graph are added to Tensorboard
-        summary_writer.add_summary(summaries, 'step%d' % global_step)
-        summary_writer.add_run_metadata(run_metadata, global_step)
+        summary_writer.add_summary(summaries, global_step)
 
 
         return loss, global_step, param_norm, gradient_norm
@@ -467,7 +470,7 @@ class QAModel(object):
         summary_writer = tf.summary.FileWriter(self.FLAGS.train_dir, session.graph)
 
         epoch = 0
-
+        global_step = 0
         logging.info("Beginning training loop...")
         while self.FLAGS.num_epochs == 0 or epoch < self.FLAGS.num_epochs:
             epoch += 1
@@ -478,7 +481,7 @@ class QAModel(object):
 
                 # Run training iteration
                 iter_tic = time.time()
-                loss, global_step, param_norm, grad_norm = self.run_train_iter(session, batch, summary_writer)
+                loss, global_step, param_norm, grad_norm = self.run_train_iter(session, batch, summary_writer, global_step)
                 iter_toc = time.time()
                 iter_time = iter_toc - iter_tic
 
