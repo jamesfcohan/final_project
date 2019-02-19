@@ -158,6 +158,8 @@ class BiDAF(object):
         """
         self.keep_prob = keep_prob
 
+
+    # squares == [1, 4, 9, 16, 25, 36]
     def build_graph(self,
                     questions,
                     questions_mask,
@@ -191,30 +193,32 @@ class BiDAF(object):
             m = questions.shape[1]
             assert contexts.shape[2] == questions.shape[2] 
             two_h = contexts.shape[2]
-            batch_size = contexts.shape[0]
+            batch_size = tf.shape(contexts)[0]
 
             # Add dimension of length 1 to contexts and questions so that when multiplied together the contexts/questions are broadcast
             # and every pair of contexts/questions is multiplied elementwise.
             contexts_reshaped = contexts[:, :, tf.newaxis, :]  # (batch_size, n, 1, 2h)
             questions_reshaped = questions[:, tf.newaxis, :, :]  # (batch_size, 1, m, 2h)
-            elementwise_product = contexts_reshaped * questions_reshaped  # (batch_size, n, m, 2h) elementwise product of all c_i * q_j
 
-            # Tile contexts and questions each to have shape (n, m, 2h) so that each context can be concatenated with each question.
-            contexts_broadcast = tf.tile(contexts_reshaped, [1, 1, m, 1])
-            questions_broadcast = tf.tile(questions_reshaped,[1, n, 1, 1])
-
-            concatenated = tf.concat(
+            elems = (contexts_reshaped, questions_reshaped)
+            def create_s(elems):
+                contexts_reshaped = elems[0]  
+                questions_reshaped = elems[1]  
+                elementwise_product = elems[0] * elems[1] 
+                contexts_broadcast = tf.tile(contexts_reshaped, [1, m, 1])
+                questions_broadcast = tf.tile(questions_reshaped, [n, 1, 1])
+                concatenated = tf.concat(
                 [contexts_broadcast, questions_broadcast, elementwise_product],
-                3)  # (batch_size, n, m, 6h)
-
-            # Downproject S such that it is (n, m) instead of (n, m, 6h)
-            S = tf.contrib.layers.fully_connected(
-                concatenated,
-                num_outputs=1,
-                activation_fn=None,
-                weights_initializer=w_sim_initializer
-            )  # shape (batch_size, n, m, 1)
-            S = tf.squeeze(S, axis=[3])  # shape (batch_size, n, m)
+                2)  # (batch_size, n, m, 6h)
+                S = tf.contrib.layers.fully_connected(
+                    concatenated,
+                    num_outputs=1,
+                    activation_fn=None,
+                    weights_initializer=w_sim_initializer
+                )  # shape (batch_size, n, m, 1)
+                S = tf.squeeze(S, axis=[2])  # shape (batch_size, n, m)
+                return S
+            S = tf.map_fn(create_s, elems, dtype=tf.float32, parallel_iterations=10)
 
             # Reshape questions_mask from (batch_size, m) to (batch_size 1, m) so that it can be used to mask questions in each row of
             # S. Axis 1 of questions_mask will be broadcast to n and questions_mask will add -infinity to each column of S wherever
@@ -416,6 +420,14 @@ def run_tests():
               14.,  16.,  25.,  36.,  49.,  64.],
             [  9.,  10.,  11.,  12.,   1.,   1.,   2.,   2.,  9.,  10.,
               22.,  24.,  45., 60., 77., 96.]], [1, 0], [1, 1, 0])
+
+    simple_test(100, [[  1.,   2.,   3.,   4.,   3.,   3.,   4.,   4.,   3.,   6.,
+          12.,  16.,   9.,  20.,  33.,  48.],
+        [  5.,   6.,   7.,   8.,   3.,   3.,   4.,   4.,  15.,  18.,
+          28.,  32.,  45.,  60.,  77.,  96.],
+        [  9.,  10.,  11.,  12.,   3.,   3.,   4.,   4.,  27.,  30.,
+          44.,  48.,  81., 100., 121., 144.]])
+
 
 
 
