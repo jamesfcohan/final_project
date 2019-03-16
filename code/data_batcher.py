@@ -210,17 +210,17 @@ def refill_batches(batches, word2id, char2id, context_file, qn_file, ans_file, b
                 context_ids = context_ids[:context_len]
 
         too_long_word = False
-        for word in context_tokens:
-            if len(word) > word_len:
+        for i in range(len(context_char_ids)):
+            if context_char_ids[i] > word_len:
                 too_long_word = True
-                word = word[:word_len]
+                context_char_ids[i] = context_char_ids[i][:word_len]
 
-        for word in qn_tokens:
-            if len(word) > word_len:
+        for i in range(len(qn_char_ids)):
+            if len(qn_char_ids[i]) > word_len:
                 too_long_word = True
-                word = word[:word_len]
-        if too_long_word and discard_long:
-            continue
+                qn_char_ids[i] = qn_char_ids[i][:word_len]
+        # if too_long_word and discard_long:
+        #     continue
 
 
         # add to examples
@@ -518,6 +518,41 @@ class TestGetBatchGenerator(unittest.TestCase):
                 word_len=word_len,
                 discard_long=True):
             assertEqual(batch.batch_size, 0)
+
+    def test_too_long_question_word_discard_long_false(self):
+        """
+        If a word is too long in the context or question but discard_long is false, then truncate long word.
+        """
+        batch_size = 4
+        context_len = 3
+        question_len = 3
+        word_len = 6
+        discard_long = True
+
+        self.write_context_lines(["abc unknown"])
+        self.write_question_lines(["unknown abc"])
+        self.write_answer_lines(["1 1"])
+
+        for batch in get_batch_generator(
+                self.word2id,
+                self.char2id,
+                self.context_file.name,
+                self.question_file.name,
+                self.answer_file.name,
+                batch_size,
+                context_len=context_len,
+                question_len=question_len,
+                word_len=word_len,
+                discard_long=False):
+
+            self.assertEqual(batch.qn_char_ids.tolist(),
+                            [[[1, 1, 1, 1, 1, 1], # unknown is truncated to six chars
+                              [2, 1, 1, 0, 0, 0],
+                              [0, 0, 0, 0, 0, 0]]])
+            self.assertEqual(batch.context_char_ids.tolist(),
+                            [[[2, 1, 1, 0, 0, 0],
+                              [1, 1, 1, 1, 1, 1], # unknown is truncated to six chars
+                              [0, 0, 0, 0, 0, 0]]])
 
 
 if __name__ == "__main__":

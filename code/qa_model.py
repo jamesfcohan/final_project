@@ -339,6 +339,7 @@ class QAModel(object):
         input_feed = self.get_input_feed(batch, include_ans_span=False, apply_dropout=False)
 
         output_feed = [self.probdist_start, self.probdist_end]
+        
         [probdist_start, probdist_end] = session.run(output_feed, input_feed)
         return probdist_start, probdist_end
 
@@ -396,7 +397,7 @@ class QAModel(object):
         # Calculate average loss
         total_num_examples = sum(batch_lengths)
         toc = time.time()
-        print("Computed dev loss over %i examples in %.2f seconds") % (total_num_examples, toc-tic)
+        print("Computed dev loss over %i examples in %.2f seconds" % (total_num_examples, toc-tic))
 
         # Overall loss is total loss divided by total number of examples
         dev_loss = sum(loss_per_batch) / float(total_num_examples)
@@ -977,7 +978,7 @@ class TestQAModel(unittest.TestCase):
             CHAR_EMBEDDING_SIZE = 4
             emb_matrix = np.ones((VOCAB_SIZE, WORD_EMBEDDING_SIZE))
 
-            BATCH_SIZE = 1
+            BATCH_SIZE = 2
             DISCARD_LONG = True
 
             qa_model = QAModel(flags, self.id2word, self.word2id, emb_matrix, self.id2char, self.char2id, CHAR_EMBEDDING_SIZE)
@@ -989,9 +990,9 @@ class TestQAModel(unittest.TestCase):
                     summary_writer = tf.summary.FileWriter(dirpath, sess.graph)
                     global_step = 0
 
-                    self.write_context_lines(["apple banana unknown"])
-                    self.write_question_lines(["orange unknown"])
-                    self.write_answer_lines(["1 1"])
+                    self.write_context_lines(["apple banana unknown", "apple"])
+                    self.write_question_lines(["orange unknown", "orange"])
+                    self.write_answer_lines(["1 1", "0 0"])
 
                     for batch in get_batch_generator(
                             self.word2id,
@@ -1009,10 +1010,12 @@ class TestQAModel(unittest.TestCase):
                         # test_2 = tf.assert_equal(qa_model.qn_char_embs, expected_qn_char_embs)
                         summary_writer = tf.summary.FileWriter(tempdir(), sess.graph)
                         
-                        input_feed = qa_model.get_input_feed(batch, include_ans_span=True, apply_dropout=True)
-                        prob_start, prob_end = sess.run([qa_model.probdist_start, qa_model.probdist_start], input_feed)
-                        print("prob_start:", prob_start)
-                        print("prob_end:", prob_end)
+                        # input_feed = qa_model.get_input_feed(batch, include_ans_span=True, apply_dropout=True)
+                        # prob_start, prob_end = sess.run([qa_model.probdist_start, qa_model.probdist_start], input_feed)
+                        start_dist, end_dist = qa_model.get_prob_dists(sess, batch)
+                        print("prob_start:", start_dist)
+                        print("prob_end:", end_dist)
+
 
     def test_run_train_iter(self):
         with tf.Graph().as_default():
