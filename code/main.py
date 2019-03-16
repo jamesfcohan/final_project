@@ -113,8 +113,6 @@ def main(unused_argv):
     # Print out Tensorflow version
     print "This code was developed and tested on TensorFlow 1.4.1. Your TensorFlow version: %s" % tf.__version__
 
-    if FLAGS.mode == "debug":
-        return
 
     # Define train_dir
     if not FLAGS.experiment_name and not FLAGS.train_dir and FLAGS.mode != "official_eval":
@@ -129,29 +127,26 @@ def main(unused_argv):
 
     # Load embedding matrix and vocab mappings
     emb_matrix, word2id, id2word = get_glove(FLAGS.glove_path, FLAGS.embedding_size)
-    char2id, id2char = get_chars()
+    char2id, id2char = get_chars(os.path.join(DEFAULT_DATA_DIR, "char_vocabulary.txt"))
 
     # Get filepaths to train/dev datafiles for tokenized queries, contexts and answers
-    train_context_path = os.path.join(FLAGS.data_dir, "train.context")
-    train_qn_path = os.path.join(FLAGS.data_dir, "train.question")
-    train_ans_path = os.path.join(FLAGS.data_dir, "train.span")
-    debug_context_path = os.path.join(FLAGS.data_dir, "debug.context")
-    debug_qn_path = os.path.join(FLAGS.data_dir, "debug.question")
-    debug_ans_path = os.path.join(FLAGS.data_dir, "debug.span")
+    train_context_path = os.path.join(FLAGS.data_dir, "train.context") if FLAGS.mode == "train" else os.path.join(FLAGS.data_dir, "debug.context")
+    train_qn_path = os.path.join(FLAGS.data_dir, "train.question") if FLAGS.mode == "train" else os.path.join(FLAGS.data_dir, "debug.question")
+    train_ans_path = os.path.join(FLAGS.data_dir, "train.span") if FLAGS.mode == "train" else  os.path.join(FLAGS.data_dir, "debug.span")
     dev_context_path = os.path.join(FLAGS.data_dir, "dev.context")
     dev_qn_path = os.path.join(FLAGS.data_dir, "dev.question")
     dev_ans_path = os.path.join(FLAGS.data_dir, "dev.span")
 
 
     # Initialize model
-    qa_model = QAModel(FLAGS, id2word, word2id, emb_matrix, id2char, char2id, char_embedding_size)
+    qa_model = QAModel(FLAGS, id2word, word2id, emb_matrix, id2char, char2id, FLAGS.char_embedding_size)
 
     # Some GPU settings
     config=tf.ConfigProto()
     config.gpu_options.allow_growth = True
 
     # Split by mode
-    if FLAGS.mode == "train":
+    if FLAGS.mode == "train" or FLAGS.mode == "debug":
 
         # Setup train dir and logfile
         if not os.path.exists(FLAGS.train_dir):
