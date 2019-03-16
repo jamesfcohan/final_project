@@ -21,16 +21,30 @@ from __future__ import division
 import random
 import time
 import re
+import unittest
+import tempfile
 
 import numpy as np
 from six.moves import xrange
 from vocab import PAD_ID, UNK_ID
 
-
 class Batch(object):
     """A class to hold the information needed for a training batch"""
 
-    def __init__(self, context_ids, context_mask, context_tokens, qn_ids, qn_mask, qn_tokens, ans_span, ans_tokens, uuids=None):
+    def __init__(self,
+                 context_ids,
+                 context_mask,
+                 context_char_ids,
+                 context_char_masks,
+                 context_tokens,
+                 qn_ids,
+                 qn_mask,
+                 qn_char_ids,
+                 qn_char_masks,
+                 qn_tokens,
+                 ans_span,
+                 ans_tokens,
+                 uuids=None):
         """
         Inputs:
           {context/qn}_ids: Numpy arrays.
@@ -44,10 +58,14 @@ class Batch(object):
         """
         self.context_ids = context_ids
         self.context_mask = context_mask
+        self.context_char_ids = context_char_ids
+        self.context_char_masks = context_char_masks
         self.context_tokens = context_tokens
 
         self.qn_ids = qn_ids
         self.qn_mask = qn_mask
+        self.qn_char_ids = qn_char_ids
+        self.qn_char_masks = qn_char_masks
         self.qn_tokens = qn_tokens
 
         self.ans_span = ans_span
@@ -57,6 +75,25 @@ class Batch(object):
 
         self.batch_size = len(self.context_tokens)
 
+    def __str__(self):
+        return ("context_tokens: %s\n"
+                "context_ids: %s\n"
+                "context_mask: %s\n"
+                "context_char_ids: %s\n" 
+                "context_char_masks: %s\n"
+                "\n"
+                "qn_tokens: %s\n"
+                "qn_ids: %s\n"
+                "qn_mask: %s\n"
+                "qn_char_ids: %s\n"
+                "qn_char_masks: %s\n"
+                "\n"
+                "ans_span: %s\n"
+                "ans_tokens: %s\n")% (
+            self.context_tokens, self.context_ids, self.context_mask, self.context_char_ids,
+            self.context_char_masks, self.qn_tokens, self.qn_ids, self.qn_mask,
+            self.qn_char_ids, self.qn_char_masks, 
+            self.ans_span, self.ans_tokens)
 
 def split_by_whitespace(sentence):
     words = []
@@ -79,8 +116,36 @@ def sentence_to_token_ids(sentence, word2id):
     ids = [word2id.get(w, UNK_ID) for w in tokens]
     return tokens, ids
 
+def tokens_to_char_ids(tokens, char2id):
+    """Turns an already-tokenized sentence string into word indices
+    e.g. "i do n't know" -> [9, 32, 16, 96]
+    Note any token that isn't in the word2id mapping gets mapped to the id for UNK
+    """
 
-def padded(token_batch, batch_pad=0):
+    token_ids = []
+    for token in tokens:
+        token_ids.append([char2id.get(c, UNK_ID) for c in token])
+    return token_ids
+
+def padded(token_batch, is_char_ids, batch_pad=0):
+    """
+    Inputs:
+      token_batch: List (length batch size) of lists of ints.
+      is_char_ids: True if given character ids, false if given word ids. 
+      batch_pad: Int. Length to pad to. If 0, pad to maximum length sequence in token_batch.
+    Returns:
+      List (length batch_size) of padded of lists of ints.
+        All are same length - batch_pad if batch_pad!=0, otherwise the maximum length in token_batch
+    """
+    maxlen = max(map(lambda x: len(x), token_batch)) if batch_pad == 0 else batch_pad
+
+    # If given words, padding should be the PAD_ID token.
+    # If given characters, padding should be empty arrays, one for each word of padding. Each empty array
+    # will later get turned into an array of character padding by char_padded.
+    padding = [PAD_ID] if not is_char_ids else [[]]
+    return map(lambda token_list: token_list + padding * (maxlen - len(token_list)), token_batch) 
+
+def char_padded(token_batch, max_word_len):
     """
     Inputs:
       token_batch: List (length batch size) of lists of ints.
@@ -89,11 +154,10 @@ def padded(token_batch, batch_pad=0):
       List (length batch_size) of padded of lists of ints.
         All are same length - batch_pad if batch_pad!=0, otherwise the maximum length in token_batch
     """
-    maxlen = max(map(lambda x: len(x), token_batch)) if batch_pad == 0 else batch_pad
-    return map(lambda token_list: token_list + [PAD_ID] * (maxlen - len(token_list)), token_batch)
+    return map(lambda token_list: [word + [PAD_ID] * (max_word_len - len(word)) for word in token_list], token_batch)
 
 
-def refill_batches(batches, word2id, context_file, qn_file, ans_file, batch_size, context_len, question_len, discard_long):
+def refill_batches(batches, word2id, char2id, context_file, qn_file, ans_file, batch_size, context_len, question_len, word_len, discard_long):
     """
     Adds more batches into the "batches" list.
 
@@ -115,7 +179,10 @@ def refill_batches(batches, word2id, context_file, qn_file, ans_file, batch_size
 
         # Convert tokens to word ids
         context_tokens, context_ids = sentence_to_token_ids(context_line, word2id)
+        context_char_ids = tokens_to_char_ids(context_tokens, char2id)
         qn_tokens, qn_ids = sentence_to_token_ids(qn_line, word2id)
+        qn_char_ids = tokens_to_char_ids(qn_tokens, char2id)
+
         ans_span = intstr_to_intlist(ans_line)
 
         # read the next line from each file
@@ -142,8 +209,22 @@ def refill_batches(batches, word2id, context_file, qn_file, ans_file, batch_size
             else: # truncate
                 context_ids = context_ids[:context_len]
 
+        too_long_word = False
+        for word in context_tokens:
+            if len(word) > word_len:
+                too_long_word = True
+                word = word[:word_len]
+
+        for word in qn_tokens:
+            if len(word) > word_len:
+                too_long_word = True
+                word = word[:word_len]
+        if too_long_word and discard_long:
+            continue
+
+
         # add to examples
-        examples.append((context_ids, context_tokens, qn_ids, qn_tokens, ans_span, ans_tokens))
+        examples.append((context_ids, context_char_ids, context_tokens, qn_ids, qn_char_ids, qn_tokens, ans_span, ans_tokens))
 
         # stop refilling if you have 160 batches
         if len(examples) == batch_size * 160:
@@ -159,9 +240,9 @@ def refill_batches(batches, word2id, context_file, qn_file, ans_file, batch_size
     for batch_start in xrange(0, len(examples), batch_size):
 
         # Note: each of these is a list length batch_size of lists of ints (except on last iter when it might be less than batch_size)
-        context_ids_batch, context_tokens_batch, qn_ids_batch, qn_tokens_batch, ans_span_batch, ans_tokens_batch = zip(*examples[batch_start:batch_start+batch_size])
+        context_ids_batch, context_char_ids_batch, context_tokens_batch, qn_ids_batch, qn_char_ids_batch, qn_tokens_batch, ans_span_batch, ans_tokens_batch = zip(*examples[batch_start:batch_start+batch_size])
 
-        batches.append((context_ids_batch, context_tokens_batch, qn_ids_batch, qn_tokens_batch, ans_span_batch, ans_tokens_batch))
+        batches.append((context_ids_batch, context_char_ids_batch, context_tokens_batch, qn_ids_batch, qn_char_ids_batch, qn_tokens_batch, ans_span_batch, ans_tokens_batch))
 
     # shuffle the batches
     random.shuffle(batches)
@@ -171,7 +252,7 @@ def refill_batches(batches, word2id, context_file, qn_file, ans_file, batch_size
     return
 
 
-def get_batch_generator(word2id, context_path, qn_path, ans_path, batch_size, context_len, question_len, discard_long):
+def get_batch_generator(word2id, char2id, context_path, qn_path, ans_path, batch_size, context_len, question_len, word_len, discard_long):
     """
     This function returns a generator object that yields batches.
     The last batch in the dataset will be a partial batch.
@@ -190,31 +271,254 @@ def get_batch_generator(word2id, context_path, qn_path, ans_path, batch_size, co
 
     while True:
         if len(batches) == 0: # add more batches
-            refill_batches(batches, word2id, context_file, qn_file, ans_file, batch_size, context_len, question_len, discard_long)
+            refill_batches(batches, word2id, char2id, context_file, qn_file, ans_file, batch_size, context_len, question_len, word_len, discard_long)
         if len(batches) == 0:
             break
 
         # Get next batch. These are all lists length batch_size
-        (context_ids, context_tokens, qn_ids, qn_tokens, ans_span, ans_tokens) = batches.pop(0)
+        (context_ids, context_char_ids, context_tokens, qn_ids, qn_char_ids, qn_tokens, ans_span, ans_tokens) = batches.pop(0)
 
         # Pad context_ids and qn_ids
-        qn_ids = padded(qn_ids, question_len) # pad questions to length question_len
-        context_ids = padded(context_ids, context_len) # pad contexts to length context_len
+        qn_ids = padded(qn_ids, False, question_len) # pad questions to length question_len
+        context_ids = padded(context_ids, False, context_len) # pad contexts to length context_len
+        context_char_ids = padded(context_char_ids, True, context_len)
+        qn_char_ids = padded(qn_char_ids, True, question_len)
+        
+        # Make context_ids into a np array and create context_mask
+        context_ids = np.array(context_ids) # shape (batch_size, context_len)
+        context_mask = (context_ids != PAD_ID).astype(np.int32) # shape (batch_size, context_len)
+        
+        context_char_ids = char_padded(context_char_ids, word_len)
+        context_char_ids = np.array(context_char_ids)
+        context_char_masks = (context_char_ids != PAD_ID).astype(np.int32)
 
         # Make qn_ids into a np array and create qn_mask
         qn_ids = np.array(qn_ids) # shape (batch_size, question_len)
         qn_mask = (qn_ids != PAD_ID).astype(np.int32) # shape (batch_size, question_len)
+        
+        qn_char_ids = char_padded(qn_char_ids, word_len)
+        qn_char_ids = np.array(qn_char_ids)
+        qn_char_masks = (qn_char_ids != PAD_ID).astype(np.int32)
 
-        # Make context_ids into a np array and create context_mask
-        context_ids = np.array(context_ids) # shape (batch_size, context_len)
-        context_mask = (context_ids != PAD_ID).astype(np.int32) # shape (batch_size, context_len)
 
         # Make ans_span into a np array
         ans_span = np.array(ans_span) # shape (batch_size, 2)
 
         # Make into a Batch object
-        batch = Batch(context_ids, context_mask, context_tokens, qn_ids, qn_mask, qn_tokens, ans_span, ans_tokens)
+        batch = Batch(context_ids, context_mask, context_char_ids, context_char_masks, context_tokens, qn_ids, qn_mask, qn_char_ids, qn_char_masks, qn_tokens, ans_span, ans_tokens)
 
         yield batch
 
     return
+
+class TestGetBatchGenerator(unittest.TestCase):
+    def setUp(self):
+        _PAD = b"<pad>"
+        _UNK = b"<unk>"
+
+        self.char2id = {
+            _PAD: PAD_ID,
+            _UNK: UNK_ID,
+            'a': 2,
+        }
+        self.word2id = {
+            _PAD: PAD_ID,
+            _UNK: UNK_ID,
+            'abc': 2,
+        }
+
+        self.context_file = tempfile.NamedTemporaryFile()
+        self.question_file = tempfile.NamedTemporaryFile()
+
+        self.answer_file = tempfile.NamedTemporaryFile()
+
+    def write_context_lines(self, lines):
+        for line in lines:
+            self.context_file.write(line + '\n')
+        self.context_file.flush()
+
+    def write_question_lines(self, lines):
+        for line in lines:
+            self.question_file.write(line + '\n')
+        self.question_file.flush()
+
+    def write_answer_lines(self, lines):
+        for line in lines:
+            self.answer_file.write(line + '\n')
+        self.answer_file.flush()
+
+    def tearDown(self):
+        self.context_file.close()
+        self.question_file.close()
+        self.answer_file.close()
+
+    def test_tokens_to_char_ids(self):
+        tokens = ["abc", "unknown"]
+        expected_char_ids = [[2, 1, 1], [1, 1, 1, 1, 1, 1, 1]]
+        self.assertEqual(expected_char_ids,
+                         tokens_to_char_ids(tokens, self.char2id))
+
+    def test_get_batch_generator(self):
+        batch_size = 4
+        context_len = 3
+        question_len = 3
+        word_len = 7
+        discard_long = True
+
+        self.write_context_lines(["abc unknown"])
+        self.write_question_lines(["unknown abc"])
+        self.write_answer_lines(["1 1"])
+
+        for batch in get_batch_generator(
+                self.word2id,
+                self.char2id,
+                self.context_file.name,
+                self.question_file.name,
+                self.answer_file.name,
+                batch_size,
+                context_len=context_len,
+                question_len=question_len,
+                word_len=word_len,
+                discard_long=True):
+            self.assertEqual(batch.context_ids.tolist(), [[2, 1, 0]])
+            self.assertEqual(batch.context_mask.tolist(), [[1, 1, 0]])
+            self.assertEqual(batch.context_char_ids.tolist(),
+                             [[[2, 1, 1, 0, 0, 0, 0], [1, 1, 1, 1, 1, 1, 1],
+                               [0, 0, 0, 0, 0, 0, 0]]])
+            self.assertEqual(batch.context_char_masks.tolist(),
+                             [[[1, 1, 1, 0, 0, 0, 0], [1, 1, 1, 1, 1, 1, 1],
+                               [0, 0, 0, 0, 0, 0, 0]]])
+            self.assertEqual(batch.context_tokens, (["abc", "unknown"], ))
+            self.assertEqual(batch.qn_ids.tolist(), [[1, 2, 0]])
+            self.assertEqual(batch.qn_mask.tolist(), [[1, 1, 0]])
+            self.assertEqual(batch.qn_char_ids.tolist(),
+                             [[[1, 1, 1, 1, 1, 1, 1], [2, 1, 1, 0, 0, 0, 0],
+                               [0, 0, 0, 0, 0, 0, 0]]])
+            self.assertEqual(batch.qn_char_masks.tolist(),
+                             [[[1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 0, 0, 0, 0],
+                               [0, 0, 0, 0, 0, 0, 0]]])
+            self.assertEqual(batch.qn_tokens, (["unknown", "abc"], ))
+            self.assertEqual(batch.ans_span.tolist(), [[1, 1]])
+            self.assertEqual(batch.ans_tokens, (["unknown"], ))
+
+    def test_two_examples(self):
+        batch_size = 4
+        context_len = 3
+        question_len = 3
+        word_len = 7
+        discard_long = True
+
+        self.write_context_lines(["abc unknown", "abc"])
+        self.write_question_lines(["unknown abc", "abc"])
+        self.write_answer_lines(["1 1", "0 0"])
+
+        for batch in get_batch_generator(
+                self.word2id,
+                self.char2id,
+                self.context_file.name,
+                self.question_file.name,
+                self.answer_file.name,
+                batch_size,
+                context_len=context_len,
+                question_len=question_len,
+                word_len=word_len,
+                discard_long=True):
+            self.assertEqual(batch.context_ids.tolist(),
+                             [[2, 0, 0], [2, 1, 0]])
+            self.assertEqual(batch.context_mask.tolist(),
+                             [[1, 0, 0], [1, 1, 0]])
+            self.assertEqual(batch.context_char_ids.tolist(),
+                             [[[2, 1, 1, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0],
+                               [0, 0, 0, 0, 0, 0, 0]],
+                              [[2, 1, 1, 0, 0, 0, 0], [1, 1, 1, 1, 1, 1, 1],
+                               [0, 0, 0, 0, 0, 0, 0]]])
+            self.assertEqual(batch.context_char_masks.tolist(),
+                             [[[1, 1, 1, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0],
+                               [0, 0, 0, 0, 0, 0, 0]],
+                              [[1, 1, 1, 0, 0, 0, 0], [1, 1, 1, 1, 1, 1, 1],
+                               [0, 0, 0, 0, 0, 0, 0]]])
+            self.assertEqual(batch.context_tokens, (
+                ["abc"],
+                ["abc", "unknown"],
+            ))
+            self.assertEqual(batch.qn_ids.tolist(), [[2, 0, 0], [1, 2, 0]])
+            self.assertEqual(batch.qn_mask.tolist(), [[1, 0, 0], [1, 1, 0]])
+            self.assertEqual(batch.qn_char_ids.tolist(),
+                             [[[2, 1, 1, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0],
+                               [0, 0, 0, 0, 0, 0, 0]],
+                              [[1, 1, 1, 1, 1, 1, 1], [2, 1, 1, 0, 0, 0, 0],
+                               [0, 0, 0, 0, 0, 0, 0]]])
+            self.assertEqual(batch.qn_char_masks.tolist(),
+                             [[[1, 1, 1, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0],
+                               [0, 0, 0, 0, 0, 0, 0]],
+                              [[1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 0, 0, 0, 0],
+                               [0, 0, 0, 0, 0, 0, 0]]])
+            self.assertEqual(batch.qn_tokens, (
+                ["abc"],
+                ["unknown", "abc"],
+            ))
+            self.assertEqual(batch.ans_span.tolist(), [[0, 0], [1, 1]])
+            self.assertEqual(batch.ans_tokens, (
+                ["abc"],
+                ["unknown"],
+            ))
+
+    def test_too_long_context_word(self):
+        """
+        If even a single word is too long in the context or question, the entire example should be thrown out. Here
+        word_len is 6 but "unknown" is of length 7
+        """
+        batch_size = 4
+        context_len = 3
+        question_len = 3
+        word_len = 6
+        discard_long = True
+
+        self.write_context_lines(["abc unknown"])
+        self.write_question_lines(["abc"])
+        self.write_answer_lines(["1 1"])
+
+        for batch in get_batch_generator(
+                self.word2id,
+                self.char2id,
+                self.context_file.name,
+                self.question_file.name,
+                self.answer_file.name,
+                batch_size,
+                context_len=context_len,
+                question_len=question_len,
+                word_len=word_len,
+                discard_long=True):
+            assertEqual(batch.batch_size, 0)
+
+    def test_too_long_question_word(self):
+        """
+        If even a single word is too long in the context or question, the entire example should be thrown out. Here
+        word_len is 6 but "unknown" is of length 7
+        """
+        batch_size = 4
+        context_len = 3
+        question_len = 3
+        word_len = 6
+        discard_long = True
+
+        self.write_context_lines(["abc"])
+        self.write_question_lines(["unknown abc"])
+        self.write_answer_lines(["1 1"])
+
+        for batch in get_batch_generator(
+                self.word2id,
+                self.char2id,
+                self.context_file.name,
+                self.question_file.name,
+                self.answer_file.name,
+                batch_size,
+                context_len=context_len,
+                question_len=question_len,
+                word_len=word_len,
+                discard_long=True):
+            assertEqual(batch.batch_size, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

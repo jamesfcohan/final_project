@@ -14,6 +14,10 @@
 from __future__ import print_function
 """This file contains some basic model components"""
 
+import unittest
+import numpy as np
+
+
 import tensorflow as tf
 from tensorflow.python.ops.rnn_cell import DropoutWrapper
 from tensorflow.python.ops import variable_scope as vs
@@ -25,6 +29,94 @@ tf.app.flags.DEFINE_boolean(
     "Whether or not this is running in a test. When running in test sets parameter weights to 1 to simplify calculations."
 )
 FLAGS = tf.app.flags.FLAGS
+
+
+class CNNEncoder(object):
+    """
+    General-purpose module to encode a sequence using a RNN.
+    It feeds the input through a RNN and returns all the hidden states.
+
+    Note: In lecture 8, we talked about how you might use a RNN as an "encoder"
+    to get a single, fixed size vector representation of a sequence
+    (e.g. by taking element-wise max of hidden states).
+    Here, we're using the RNN as an "encoder" but we're not taking max;
+    we're just returning all the hidden states. The terminology "encoder"
+    still applies because we're getting a different "encoding" of each
+    position in the sequence, and we'll use the encodings downstream in the model.
+
+    This code uses a bidirectional GRU, but you could experiment with other types of RNN.
+    """
+
+    def __init__(self, word_len, num_filters, window_size, char_embedding_size, keep_prob, initializer=tf.contrib.layers.xavier_initializer()):
+        """
+        Inputs:
+          num_filters: Should equal word embedding size since the number of filters is what determines the len of the CNN output
+          keep_prob: Tensor containing a single scalar that is the keep probability (for dropout)
+        """
+        self.word_len = word_len
+        self.num_filters = num_filters
+        self.window_size = window_size
+        self.char_embedding_size = char_embedding_size
+        self.keep_prob = keep_prob
+
+        conv_filt_shape = [self.window_size, self.char_embedding_size, 1, self.num_filters]
+        self.weights = tf.get_variable("conv_weights"+'_W', shape=conv_filt_shape, dtype=tf.float32, initializer=initializer)
+        self.bias = tf.get_variable("conv_weights"+'_b', shape=[self.num_filters], dtype=tf.float32, initializer=initializer)
+
+    def build_graph(self, inputs, masks):
+        """
+        Inputs:
+          inputs: Tensor shape (batch_size, sentence_len, word_len, char_embedding_len)
+          masks: Tensor shape (batch_size, sentence_len, word_len).
+            Has 1s where there is real input, 0s where there's padding.
+            This is used to make sure tf.nn.bidirectional_dynamic_rnn doesn't iterate through masked steps.
+
+        Returns:
+          out: Tensor shape (batch_size, seq_len, hidden_size*2).
+            This is all hidden states (fw and bw hidden states are concatenated).
+        """
+        with vs.variable_scope("CNNEncoder"):
+            # word_lens = tf.reduce_sum(
+            #     masks, reduction_indices=2)  # shape (batch_size x sentence_len)
+            sentence_len = tf.shape(inputs)[1]
+
+            inputs = inputs*tf.cast(tf.expand_dims(masks, -1), tf.float32)
+
+            inputs = tf.reshape(inputs, [-1, self.word_len, self.char_embedding_size])
+
+            # input should be of shape [batch, in_height=WORD_SIZE, in_width=CHAR_EMBEDDING_SIZE, in_channels=1]
+            # THEREFORE WANT MATRIX WHETERE EACH ROW IS A CHARACTER EMBEDDING
+
+            # setup the filter input shape for tf.nn.conv_2d
+            # Want filter to be of size 
+            # filter_height = window_size
+            # filter_width = char_embedding_size
+            # input_channels = 1
+            # num_filters should equal word_embedding_size so that after max pooling we end up with a vector of size word_embedding_size for each word
+
+
+            # Setup the convolutional layer operation
+            # stride = [1, 1, 1, 1]: how much to move filter over each of the four input dimensions
+            conv_layer = tf.nn.conv2d(tf.expand_dims(inputs, -1), self.weights, [1, 1, 1, 1], padding='VALID')
+            conv_layer += self.bias
+            conv_layer = tf.nn.relu(conv_layer)
+
+            # now perform max pooling
+
+            # ksize = size of pooling window for each dimension in out_layer. 
+            # Want to pool elementwise so that we end up with a vector of size filter_size.
+            # After convolution we have matrix of size (WORD_LEN-window_wsize+1 x filter_size)
+            # max pool each columns so that we end up with a single number for each filter
+            ksize = [1, self.word_len - self.window_size + 1, 1, 1] 
+            strides = [1, 1, 1, 1]
+            out_layer = tf.nn.max_pool(conv_layer, ksize=ksize, strides=strides, 
+                                       padding='VALID')
+            out_layer = tf.reshape(tf.squeeze(out_layer), [-1, sentence_len, self.num_filters])
+   
+            # # Apply dropout
+            # out = tf.nn.dropout(out, self.keep_prob)
+
+            return conv_layer, out_layer
 
 
 class RNNEncoder(object):
@@ -420,9 +512,142 @@ def run_tests():
 
 
 
-def main(unused_argv):
-    run_tests()
+class TestModules(unittest.TestCase):
+
+    def test_cnn_encoder(self):
+        """
+        Test CNNEncoder on batch of size two. Uses padding chars which must be masked.
+        """
+        with tf.Graph().as_default():
+            batch_size = 2
+            qn_len = 3                
+            word_len = 7
+
+            num_filters=3
+            window_size=2
+            char_embedding_size=4
+            keep_prob = 1
+
+            qn_char_embs = tf.constant([[[[ 4.,  5.,  6.,  7.], # O
+                                     [ 4.,  5.,  6.,  7.], # R
+                                     [ 8.,  9., 10., 11.], # A - > 2
+                                     [ 4.,  5.,  6.,  7.], # N
+                                     [ 4.,  5.,  6.,  7.], # G
+                                     [ 4.,  5.,  6.,  7.], # E
+                                     [ 0.,  1.,  2.,  3.]], # PAD
+
+                                    [[ 0.,  1.,  2.,  3.], # PAD
+                                     [ 0.,  1.,  2.,  3.], # PAD
+                                     [ 0.,  1.,  2.,  3.], # PAD
+                                     [ 0.,  1.,  2.,  3.], # PAD
+                                     [ 0.,  1.,  2.,  3.], # PAD
+                                     [ 0.,  1.,  2.,  3.], # PAD
+                                     [ 0.,  1.,  2.,  3.]],
+
+                                    [[ 0.,  1.,  2.,  3.], # PAD
+                                     [ 0.,  1.,  2.,  3.], # PAD
+                                     [ 0.,  1.,  2.,  3.], # PAD
+                                     [ 0.,  1.,  2.,  3.], # PAD
+                                     [ 0.,  1.,  2.,  3.], # PAD
+                                     [ 0.,  1.,  2.,  3.], # PAD
+                                     [ 0.,  1.,  2.,  3.]]], #PAD
+
+                                    [[[ 4.,  5.,  6.,  7.], # O
+                                     [ 4.,  5.,  6.,  7.], # R
+                                     [ 8.,  9., 10., 11.], # A - > 2
+                                     [ 4.,  5.,  6.,  7.], # N
+                                     [ 4.,  5.,  6.,  7.], # G
+                                     [ 4.,  5.,  6.,  7.], # E
+                                     [ 0.,  1.,  2.,  3.]], # PAD
+
+                                    [[ 4.,  5.,  6.,  7.], # U
+                                     [ 4.,  5.,  6.,  7.], # N
+                                     [ 4.,  5.,  6.,  7.], # K
+                                     [ 4.,  5.,  6.,  7.], # N
+                                     [ 4.,  5.,  6.,  7.], # O
+                                     [ 4.,  5.,  6.,  7.], # W
+                                     [ 4.,  5.,  6.,  7.]], # N
+
+                                    [[ 0.,  1.,  2.,  3.], # PAD
+                                     [ 0.,  1.,  2.,  3.], # PAD
+                                     [ 0.,  1.,  2.,  3.], # PAD
+                                     [ 0.,  1.,  2.,  3.], # PAD
+                                     [ 0.,  1.,  2.,  3.], # PAD
+                                     [ 0.,  1.,  2.,  3.], # PAD
+                                     [ 0.,  1.,  2.,  3.]]]], dtype=tf.float32) #PAD 
+            qn_char_masks = np.array([[[1, 1, 1, 1, 1, 1, 0], 
+                                [0, 0, 0, 0, 0, 0, 0],
+                                [0, 0, 0, 0, 0, 0, 0]],
+
+                                [[1, 1, 1, 1, 1, 1, 0], 
+                                [1, 1, 1, 1, 1, 1, 1],
+                                [0, 0, 0, 0, 0, 0, 0]]])
+            expected_conv_output = [[[[45., 45., 45.]],
+                                      [[61., 61., 61.]],
+                                      [[61., 61., 61.]],
+                                      [[45., 45., 45.]],
+                                      [[45., 45., 45.]],
+                                      [[23., 23., 23.]]],
+
+                                     [[[1., 1., 1.]],
+                                      [[1., 1., 1.]],
+                                      [[1., 1., 1.]],
+                                      [[1., 1., 1.]],
+                                      [[1., 1., 1.]],
+                                      [[1., 1., 1.]]],
+
+                                     [[[1., 1., 1.]],
+                                      [[1., 1., 1.]],
+                                      [[1., 1., 1.]],
+                                      [[1., 1., 1.]],
+                                      [[1., 1., 1.]],
+                                      [[1., 1., 1.]]],
+
+
+                                     [[[45., 45., 45.]],
+                                      [[61., 61., 61.]],
+                                      [[61., 61., 61.]],
+                                      [[45., 45., 45.]],
+                                      [[45., 45., 45.]],
+                                      [[23., 23., 23.]]],
+
+                                     [[[45., 45., 45.]],
+                                      [[45., 45., 45.]],
+                                      [[45., 45., 45.]],
+                                      [[45., 45., 45.]],
+                                      [[45., 45., 45.]],
+                                      [[45., 45., 45.]]],
+
+                                     [[[1., 1., 1.]],
+                                      [[1., 1., 1.]],
+                                      [[1., 1., 1.]],
+                                      [[1., 1., 1.]],
+                                      [[1., 1., 1.]],
+                                      [[1., 1., 1.]]]]
+
+            expected_max_pool_out = [[[61., 61., 61.],
+                                      [1., 1., 1.],
+                                      [1., 1., 1.]],
+
+                                     [[61., 61., 61.],
+                                      [45., 45., 45.],
+                                      [1., 1., 1.]]]
+
+            encoder = CNNEncoder(word_len, num_filters,window_size, char_embedding_size,keep_prob, initializer=tf.initializers.ones())
+            conv_out, max_pool_out = encoder.build_graph(qn_char_embs, qn_char_masks)
+
+            conv_test = tf.assert_equal(conv_out, expected_conv_output)
+            max_pool_test = tf.assert_equal(max_pool_out, expected_max_pool_out)
+
+            init = tf.global_variables_initializer()
+            with tf.Session() as sess:
+                sess.run(init)
+                sess.run([conv_test, max_pool_test])
+
+        # Output after convolution should be (batch_size*qn_len = 6, word_len-filter_size+1 = 6, num_filters = 3)
+        # Output after pooling should be of shape (batch_size = 2, qn_len = 3, num_filters = 3)
+
 
 
 if __name__ == "__main__":
-    tf.app.run()
+    unittest.main()

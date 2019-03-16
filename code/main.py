@@ -26,7 +26,7 @@ import logging
 import tensorflow as tf
 
 from qa_model import QAModel
-from vocab import get_glove
+from vocab import get_glove, get_chars
 from official_eval_helper import get_json_data, generate_answers
 
 
@@ -35,7 +35,6 @@ logging.basicConfig(level=logging.INFO)
 MAIN_DIR = os.path.relpath(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) # relative path of the main directory
 DEFAULT_DATA_DIR = os.path.join(MAIN_DIR, "data") # relative path of data dir
 EXPERIMENTS_DIR = os.path.join(MAIN_DIR, "experiments") # relative path of experiments dir
-
 
 # High-level options
 tf.app.flags.DEFINE_integer("gpu", 0, "Which GPU to use, if you have multiple.")
@@ -50,8 +49,12 @@ tf.app.flags.DEFINE_float("dropout", 0.15, "Fraction of units randomly dropped o
 tf.app.flags.DEFINE_integer("batch_size", 100, "Batch size to use")
 tf.app.flags.DEFINE_integer("hidden_size", 200, "Size of the hidden states")
 tf.app.flags.DEFINE_integer("context_len", 600, "The maximum context length of your model")
+tf.app.flags.DEFINE_integer("word_len", 20, "The maximum word length of your model")
 tf.app.flags.DEFINE_integer("question_len", 30, "The maximum question length of your model")
 tf.app.flags.DEFINE_integer("embedding_size", 100, "Size of the pretrained word vectors. This needs to be one of the available GloVe dimensions: 50/100/200/300")
+tf.app.flags.DEFINE_integer("char_embedding_size", 20, "Size of the char vectors.")
+tf.app.flags.DEFINE_integer("window_size", 3, "Convolution window size - number of chars")
+tf.app.flags.DEFINE_integer("num_filters", 100, "Number of filters - size of output of convolution for each word")
 
 # How often to print, save, eval
 tf.app.flags.DEFINE_integer("print_every", 1, "How many iterations to do per print.")
@@ -110,6 +113,9 @@ def main(unused_argv):
     # Print out Tensorflow version
     print "This code was developed and tested on TensorFlow 1.4.1. Your TensorFlow version: %s" % tf.__version__
 
+    if FLAGS.mode == "debug":
+        return
+
     # Define train_dir
     if not FLAGS.experiment_name and not FLAGS.train_dir and FLAGS.mode != "official_eval":
         raise Exception("You need to specify either --experiment_name or --train_dir")
@@ -123,17 +129,22 @@ def main(unused_argv):
 
     # Load embedding matrix and vocab mappings
     emb_matrix, word2id, id2word = get_glove(FLAGS.glove_path, FLAGS.embedding_size)
+    char2id, id2char = get_chars()
 
     # Get filepaths to train/dev datafiles for tokenized queries, contexts and answers
     train_context_path = os.path.join(FLAGS.data_dir, "train.context")
     train_qn_path = os.path.join(FLAGS.data_dir, "train.question")
     train_ans_path = os.path.join(FLAGS.data_dir, "train.span")
+    debug_context_path = os.path.join(FLAGS.data_dir, "debug.context")
+    debug_qn_path = os.path.join(FLAGS.data_dir, "debug.question")
+    debug_ans_path = os.path.join(FLAGS.data_dir, "debug.span")
     dev_context_path = os.path.join(FLAGS.data_dir, "dev.context")
     dev_qn_path = os.path.join(FLAGS.data_dir, "dev.question")
     dev_ans_path = os.path.join(FLAGS.data_dir, "dev.span")
 
+
     # Initialize model
-    qa_model = QAModel(FLAGS, id2word, word2id, emb_matrix)
+    qa_model = QAModel(FLAGS, id2word, word2id, emb_matrix, id2char, char2id, char_embedding_size)
 
     # Some GPU settings
     config=tf.ConfigProto()
@@ -150,7 +161,8 @@ def main(unused_argv):
 
         # Save a record of flags as a .json file in train_dir
         with open(os.path.join(FLAGS.train_dir, "flags.json"), 'w') as fout:
-            json.dump(FLAGS.__flags, fout)
+            # json.dump(FLAGS.__flags, fout)
+            json.dump(str(FLAGS.__flags), fout)
 
         # Make bestmodel dir if necessary
         if not os.path.exists(bestmodel_dir):
@@ -199,6 +211,29 @@ def main(unused_argv):
                 f.write(unicode(json.dumps(answers_dict, ensure_ascii=False)))
                 print "Wrote predictions to %s" % FLAGS.json_out_path
 
+    # elif FLAGS.mode == "debug":
+        # Setup train dir and logfile
+        # if not os.path.exists(FLAGS.train_dir):
+        #     os.makedirs(FLAGS.train_dir)
+        # file_handler = logging.FileHandler(os.path.join(FLAGS.train_dir, "log.txt"))
+        # logging.getLogger().addHandler(file_handler)
+
+        # # Save a record of flags as a .json file in train_dir
+        # with open(os.path.join(FLAGS.train_dir, "flags.json"), 'w') as fout:
+        #     # json.dump(FLAGS.__flags, fout)
+        #     json.dump(str(FLAGS.__flags), fout)
+
+        # Make bestmodel dir if necessary
+        # if not os.path.exists(bestmodel_dir):
+        #     os.makedirs(bestmodel_dir)
+
+        # with tf.Session(config=config) as sess:
+
+            # Load most recent model
+            # initialize_model(sess, qa_model, FLAGS.train_dir, expect_exists=False)
+
+            # Train
+            # qa_model.train(sess, debug_context_path, debug_qn_path, debug_ans_path, dev_qn_path, dev_context_path, dev_ans_path)
 
     else:
         raise Exception("Unexpected value of FLAGS.mode: %s" % FLAGS.mode)

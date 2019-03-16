@@ -16,11 +16,19 @@
 
 from __future__ import absolute_import
 from __future__ import division
+from __future__ import print_function
+
+
 
 import time
 import logging
 import os
 import sys
+
+import unittest
+import contextlib
+import shutil
+import tempfile
 
 import numpy as np
 import tensorflow as tf
@@ -30,14 +38,15 @@ from tensorflow.python.ops import embedding_ops
 from evaluate import exact_match_score, f1_score
 from data_batcher import get_batch_generator
 from pretty_print import print_example
-from modules import RNNEncoder, SimpleSoftmaxLayer, BasicAttn, BiDAF
+from modules import CNNEncoder, RNNEncoder, SimpleSoftmaxLayer, BasicAttn, BiDAF
+
 
 logging.basicConfig(level=logging.INFO)
 
 class QAModel(object):
     """Top-level Question Answering module"""
 
-    def __init__(self, FLAGS, id2word, word2id, emb_matrix):
+    def __init__(self, FLAGS, id2word, word2id, emb_matrix, id2char, char2id, char_embedding_size):
         """
         Initializes the QA model.
 
@@ -47,10 +56,14 @@ class QAModel(object):
           word2id: dictionary mapping word (string) to word idx (int)
           emb_matrix: numpy array shape (400002, embedding_size) containing pre-traing GloVe embeddings
         """
-        print "Initializing the QAModel..."
+        print("Initializing the QAModel...")
         self.FLAGS = FLAGS
         self.id2word = id2word
         self.word2id = word2id
+        self.id2char = id2char
+        self.char2id = char2id
+
+        self.char_embedding_size = char_embedding_size
 
         # Add all parts of the graph
         with tf.variable_scope("QAModel", initializer=tf.contrib.layers.variance_scaling_initializer(factor=1.0, uniform=True)):
@@ -85,18 +98,22 @@ class QAModel(object):
         # Add placeholders for inputs.
         # These are all batch-first: the None corresponds to batch_size and
         # allows you to run the same model with variable batch_size
-        self.context_ids = tf.placeholder(tf.int32, shape=[None, self.FLAGS.context_len])
-        self.context_mask = tf.placeholder(tf.int32, shape=[None, self.FLAGS.context_len])
-        self.qn_ids = tf.placeholder(tf.int32, shape=[None, self.FLAGS.question_len])
-        self.qn_mask = tf.placeholder(tf.int32, shape=[None, self.FLAGS.question_len])
-        self.ans_span = tf.placeholder(tf.int32, shape=[None, 2])
+        self.context_ids = tf.placeholder(tf.int32, shape=[None, self.FLAGS.context_len], name="context_ids")
+        self.context_mask = tf.placeholder(tf.int32, shape=[None, self.FLAGS.context_len], name="context_mask")
+        self.context_char_ids = tf.placeholder(tf.int32, shape=[None, self.FLAGS.context_len, self.FLAGS.word_len], name="context_char_ids")
+        self.context_char_masks = tf.placeholder(tf.int32, shape=[None, self.FLAGS.context_len, self.FLAGS.word_len], name="context_char_masks")
+        self.qn_ids = tf.placeholder(tf.int32, shape=[None, self.FLAGS.question_len], name="qn_ids")
+        self.qn_mask = tf.placeholder(tf.int32, shape=[None, self.FLAGS.question_len], name="qn_mask")
+        self.qn_char_ids = tf.placeholder(tf.int32, shape=[None, self.FLAGS.question_len, self.FLAGS.word_len], name="qn_char_ids")
+        self.qn_char_masks = tf.placeholder(tf.int32, shape=[None, self.FLAGS.question_len, self.FLAGS.word_len], name="qn_char_masks")
+        self.ans_span = tf.placeholder(tf.int32, shape=[None, 2], name="ans_span")
 
         # Add a placeholder to feed in the keep probability (for dropout).
         # This is necessary so that we can instruct the model to use dropout when training, but not when testing
-        self.keep_prob = tf.placeholder_with_default(1.0, shape=())
+        self.keep_prob = tf.placeholder_with_default(1.0, shape=(), name="keep_prob")
 
 
-    def add_embedding_layer(self, emb_matrix):
+    def add_embedding_layer(self, emb_matrix, initializer=tf.contrib.layers.xavier_initializer()):
         """
         Adds word embedding layer to the graph.
 
@@ -106,13 +123,28 @@ class QAModel(object):
         """
         with vs.variable_scope("embeddings"):
 
+            # If in test, initialize embedding matrix to be be 0, 1, 2, 3, ...
+            if tf.app.flags.FLAGS.is_test:
+                constant = [i*(len(self.id2char)-1)+ j  for i in range(len(self.id2char)) for j in range(self.char_embedding_size)]
+                initializer = tf.initializers.constant(constant)
             # Note: the embedding matrix is a tf.constant which means it's not a trainable parameter
             embedding_matrix = tf.constant(emb_matrix, dtype=tf.float32, name="emb_matrix") # shape (400002, embedding_size)
+            char_embedding_matrix = tf.get_variable("char_emb_matrix", shape=(len(self.id2char), self.char_embedding_size), dtype=tf.float32, initializer=initializer)
+            
 
             # Get the word embeddings for the context and question,
             # using the placeholders self.context_ids and self.qn_ids
             self.context_embs = embedding_ops.embedding_lookup(embedding_matrix, self.context_ids) # shape (batch_size, context_len, embedding_size)
             self.qn_embs = embedding_ops.embedding_lookup(embedding_matrix, self.qn_ids) # shape (batch_size, question_len, embedding_size)
+
+            self.context_char_embs = embedding_ops.embedding_lookup(char_embedding_matrix, self.context_char_ids) 
+            self.qn_char_embs = embedding_ops.embedding_lookup(char_embedding_matrix, self.qn_char_ids) 
+
+            # self.context_embs = tf.Print(self.context_embs, [self.context_embs])
+            # self.context_char_embs = tf.Print(self.context_char_embs, [self.context_char_embs])
+            # self.qn_char_embs = tf.Print(self.qn_char_embs, [self.qn_char_embs])
+
+
 
 
     def build_graph(self):
@@ -125,26 +157,35 @@ class QAModel(object):
           self.probdist_start, self.probdist_end: Both shape (batch_size, context_len). Each row sums to 1.
             These are the result of taking (masked) softmax of logits_start and logits_end.
         """
+        initializer=tf.contrib.layers.xavier_initializer()
+        if tf.app.flags.FLAGS.is_test:
+            initializer=tf.initializers.ones()
+        cnn_encoder = CNNEncoder(self.FLAGS.word_len, self.FLAGS.num_filters, self.FLAGS.window_size, self.char_embedding_size, self.keep_prob, initializer=initializer)
 
+        _,context_words_conv = cnn_encoder.build_graph(self.context_char_embs, self.context_char_masks)
+        _,qn_words_conv = cnn_encoder.build_graph(self.qn_char_embs, self.qn_char_masks)
+
+        context_words = tf.concat([context_words_conv, self.context_embs], -1)
+        qn_words = tf.concat([qn_words_conv, self.qn_embs], -1)
+
+        # print_op = tf.print("context_words: ", context_words)
+        # print_op_2 = tf.print("qn_words: ", qn_words)
+   
         # Use a RNN to get hidden states for the context and the question
         # Note: here the RNNEncoder is shared (i.e. the weights are the same)
         # between the context and the question.
         encoder = RNNEncoder(self.FLAGS.hidden_size, self.keep_prob)
-        context_hiddens = encoder.build_graph(self.context_embs, self.context_mask) # (batch_size, context_len, hidden_size*2)
-        question_hiddens = encoder.build_graph(self.qn_embs, self.qn_mask) # (batch_size, question_len, hidden_size*2)
+        context_hiddens = encoder.build_graph(context_words, self.context_mask) # (batch_size, context_len, hidden_size*2)
+        question_hiddens = encoder.build_graph(qn_words, self.qn_mask) # (batch_size, question_len, hidden_size*2)
 
-
-        # BasicAttn
         # Use context hidden states to attend to question hidden states
-        # attn_layer = BasicAttn(self.keep_prob, self.FLAGS.hidden_size*2, self.FLAGS.hidden_size*2)
-        # _, attn_output = attn_layer.build_graph(question_hiddens, self.qn_mask, context_hiddens) # attn_output is shape (batch_size, context_len, hidden_size*2)
-        # # Concat attn_output to context_hiddens to get blended_reps
-        # blended_reps = tf.concat([context_hiddens, attn_output], axis=2) # (batch_size, context_len, hidden_size*4)
-        
-        #BiDAF
-        attn_layer = BiDAF(self.keep_prob)
-        blended_reps = attn_layer.build_graph(question_hiddens, self.qn_mask, context_hiddens, self.context_mask) # attn_output is shape (batch_size, context_len, hidden_size*2)
+        attn_layer = BasicAttn(self.keep_prob, self.FLAGS.hidden_size*2, self.FLAGS.hidden_size*2)
+        _, attn_output = attn_layer.build_graph(question_hiddens, self.qn_mask, context_hiddens) # attn_output is shape (batch_size, context_len, hidden_size*2)
+        # with tf.control_dependencies([print_op, print_op_2]):
+            # blended_reps = tf.concat([context_hiddens, attn_output], axis=2) # (batch_size, context_len, hidden_size*4)
 
+        # Concat attn_output to context_hiddens to get blended_reps
+        blended_reps = tf.concat([context_hiddens, attn_output], axis=2) # (batch_size, context_len, hidden_size*4)
 
         # Apply fully connected layer to each blended representation
         # Note, blended_reps_final corresponds to b' in the handout
@@ -199,7 +240,29 @@ class QAModel(object):
             self.loss = self.loss_start + self.loss_end
             tf.summary.scalar('loss', self.loss)
 
+    def get_input_feed(self, batch, include_ans_span, apply_dropout):
+        input_feed = {}
+        input_feed[self.context_ids] = batch.context_ids
+        input_feed[self.context_mask] = batch.context_mask
 
+        input_feed[self.context_char_ids] = batch.context_char_ids
+        input_feed[self.context_char_masks] = batch.context_char_masks
+
+        input_feed[self.qn_ids] = batch.qn_ids
+        input_feed[self.qn_mask] = batch.qn_mask
+
+        input_feed[self.qn_char_ids] = batch.qn_char_ids
+        input_feed[self.qn_char_masks] = batch.qn_char_masks
+
+        if include_ans_span:
+            input_feed[self.ans_span] = batch.ans_span
+
+        # note if you don't supply keep_prob here, so it will default to 1 i.e. no dropout
+        if apply_dropout:
+            input_feed[self.keep_prob] = 1.0 - self.FLAGS.dropout # apply dropout
+
+        return input_feed
+    
     def run_train_iter(self, session, batch, summary_writer, global_step):
         """
         This performs a single training iteration (forward pass, loss computation, backprop, parameter update)
@@ -216,13 +279,7 @@ class QAModel(object):
           gradient_norm: Global norm of the gradients
         """
         # Match up our input data with the placeholders
-        input_feed = {}
-        input_feed[self.context_ids] = batch.context_ids
-        input_feed[self.context_mask] = batch.context_mask
-        input_feed[self.qn_ids] = batch.qn_ids
-        input_feed[self.qn_mask] = batch.qn_mask
-        input_feed[self.ans_span] = batch.ans_span
-        input_feed[self.keep_prob] = 1.0 - self.FLAGS.dropout # apply dropout
+        input_feed = self.get_input_feed(batch, include_ans_span=True, apply_dropout=True)
 
         # output_feed contains the things we want to fetch.
         output_feed = [self.updates, self.summaries, self.loss, self.global_step, self.param_norm, self.gradient_norm]
@@ -259,13 +316,7 @@ class QAModel(object):
           loss: The loss (averaged across the batch) for this batch
         """
 
-        input_feed = {}
-        input_feed[self.context_ids] = batch.context_ids
-        input_feed[self.context_mask] = batch.context_mask
-        input_feed[self.qn_ids] = batch.qn_ids
-        input_feed[self.qn_mask] = batch.qn_mask
-        input_feed[self.ans_span] = batch.ans_span
-        # note you don't supply keep_prob here, so it will default to 1 i.e. no dropout
+        input_feed = self.get_input_feed(batch, include_ans_span=True, apply_dropout=False)
 
         output_feed = [self.loss]
 
@@ -285,12 +336,7 @@ class QAModel(object):
         Returns:
           probdist_start and probdist_end: both shape (batch_size, context_len)
         """
-        input_feed = {}
-        input_feed[self.context_ids] = batch.context_ids
-        input_feed[self.context_mask] = batch.context_mask
-        input_feed[self.qn_ids] = batch.qn_ids
-        input_feed[self.qn_mask] = batch.qn_mask
-        # note you don't supply keep_prob here, so it will default to 1 i.e. no dropout
+        input_feed = self.get_input_feed(batch, include_ans_span=False, apply_dropout=False)
 
         output_feed = [self.probdist_start, self.probdist_end]
         [probdist_start, probdist_end] = session.run(output_feed, input_feed)
@@ -339,7 +385,7 @@ class QAModel(object):
         # which are longer than our context_len or question_len.
         # We need to do this because if, for example, the true answer is cut
         # off the context, then the loss function is undefined.
-        for batch in get_batch_generator(self.word2id, dev_context_path, dev_qn_path, dev_ans_path, self.FLAGS.batch_size, context_len=self.FLAGS.context_len, question_len=self.FLAGS.question_len, discard_long=True):
+        for batch in get_batch_generator(self.word2id, dev_context_path, dev_qn_path, dev_ans_path, self.FLAGS.batch_size, context_len=self.FLAGS.context_len, question_len=self.FLAGS.question_len, word_len=self.FLAGS.word_len, discard_long=True):
 
             # Get loss for this batch
             loss = self.get_loss(session, batch)
@@ -350,7 +396,7 @@ class QAModel(object):
         # Calculate average loss
         total_num_examples = sum(batch_lengths)
         toc = time.time()
-        print "Computed dev loss over %i examples in %.2f seconds" % (total_num_examples, toc-tic)
+        print("Computed dev loss over %i examples in %.2f seconds") % (total_num_examples, toc-tic)
 
         # Overall loss is total loss divided by total number of examples
         dev_loss = sum(loss_per_batch) / float(total_num_examples)
@@ -394,7 +440,7 @@ class QAModel(object):
 
         # Note here we select discard_long=False because we want to sample from the entire dataset
         # That means we're truncating, rather than discarding, examples with too-long context or questions
-        for batch in get_batch_generator(self.word2id, context_path, qn_path, ans_path, self.FLAGS.batch_size, context_len=self.FLAGS.context_len, question_len=self.FLAGS.question_len, discard_long=False):
+        for batch in get_batch_generator(self.word2id, self.char2id, context_path, qn_path, ans_path, self.FLAGS.batch_size, context_len=self.FLAGS.context_len, question_len=self.FLAGS.question_len, discard_long=False):
 
             pred_start_pos, pred_end_pos = self.get_start_end_pos(session, batch)
 
@@ -544,22 +590,483 @@ def write_summary(value, tag, summary_writer, global_step):
     summary.value.add(tag=tag, simple_value=value)
     summary_writer.add_summary(summary, global_step)
 
-# def run_tests():
-#     FLAGS.is_test = True
-#     # Test that it works on batch size of 1.
-#     simple_test(1, [[  1.,   2.,   3.,   4.,   3.,   3.,   4.,   4.,   3.,   6.,
-#               12.,  16.,   9.,  20.,  33.,  48.],
-#             [  5.,   6.,   7.,   8.,   3.,   3.,   4.,   4.,  15.,  18.,
-#               28.,  32.,  45.,  60.,  77.,  96.],
-#             [  9.,  10.,  11.,  12.,   3.,   3.,   4.,   4.,  27.,  30.,
-#               44.,  48.,  81., 100., 121., 144.]])
+
+@contextlib.contextmanager
+def cd(newdir, cleanup=lambda: True):
+    prevdir = os.getcwd()
+    os.chdir(os.path.expanduser(newdir))
+    try:
+        yield
+    finally:
+        os.chdir(prevdir)
+        cleanup()
+
+@contextlib.contextmanager
+def tempdir():
+    dirpath = tempfile.mkdtemp()
+    def cleanup():
+        shutil.rmtree(dirpath)
+    with cd(dirpath, cleanup):
+        yield dirpath
+
+class MyFlag(object):
+    def __init__(self, context_len, question_len, word_len, hidden_size, max_gradient_norm, learning_rate, dropout, keep, num_filters, window_size):
+        self.context_len = context_len
+        self.question_len = question_len
+        self.word_len = word_len
+        self.hidden_size = hidden_size
+        self.max_gradient_norm = max_gradient_norm
+        self.learning_rate = learning_rate
+        self.dropout = dropout
+        self.keep = keep
+        self.num_filters = num_filters
+        self.window_size = window_size
+
+class TestQAModel(unittest.TestCase):
+    def setUp(self):
+        tf.app.flags.FLAGS.is_test = True
+
+        self.context_file = tempfile.NamedTemporaryFile()
+        self.question_file = tempfile.NamedTemporaryFile()
+        self.answer_file = tempfile.NamedTemporaryFile()
+
+        _PAD = b"<pad>"
+        _UNK = b"<unk>"
+        PAD_ID = 0
+        UNK_ID = 1
+        self.char2id = {
+            _PAD: PAD_ID,
+            _UNK: UNK_ID,
+            'a': 2,
+            'b': 3,
+            'c': 4
+        }
+        self.word2id = {
+            _PAD: PAD_ID,
+            _UNK: UNK_ID,
+            'apple': 2,
+            'banana': 3,
+            'orange': 4
+        }
+        self.id2char = dict((v, k) for k, v in self.char2id.iteritems())
+        self.id2word = dict((v, k) for k, v in self.word2id.iteritems())
+
+    def tearDown(self):
+        self.context_file.close()
+        self.question_file.close()
+        self.answer_file.close()
+
+    def write_context_lines(self, lines):
+        for line in lines:
+            self.context_file.write(line + '\n')
+        self.context_file.flush()
+
+    def write_question_lines(self, lines):
+        for line in lines:
+            self.question_file.write(line + '\n')
+        self.question_file.flush()
+
+    def write_answer_lines(self, lines):
+        for line in lines:
+            self.answer_file.write(line + '\n')
+        self.answer_file.flush()
+
+    def test_char_embeddings(self):
+        with tf.Graph().as_default():
+            NUM_FILTERS= 3
+            WINDOW_SIZE = 2
+            CONTEXT_LEN = 4
+            QUESTION_LEN = 3
+            WORD_LEN = 7
+            HIDDEN_SIZE = 3
+            MAX_GRADIENT_NORM = 5
+            LEARNING_RATE = .001
+            DROPOUT = 0.15
+            KEEP  = 1
+            flags = MyFlag(CONTEXT_LEN, QUESTION_LEN, WORD_LEN, HIDDEN_SIZE, MAX_GRADIENT_NORM, LEARNING_RATE, DROPOUT, KEEP, NUM_FILTERS, WINDOW_SIZE)
+
+            VOCAB_SIZE= 5
+            WORD_EMBEDDING_SIZE = 4
+            CHAR_EMBEDDING_SIZE = 4
+            emb_matrix = np.ones((VOCAB_SIZE, WORD_EMBEDDING_SIZE))
+
+            BATCH_SIZE = 1
+            DISCARD_LONG = True
+
+            qa_model = QAModel(flags, self.id2word, self.word2id, emb_matrix, self.id2char, self.char2id, CHAR_EMBEDDING_SIZE)
+
+            init = tf.global_variables_initializer()
+            with tf.Session() as sess:
+                sess.run(init)
+                with tempdir() as dirpath:
+                    summary_writer = tf.summary.FileWriter(dirpath, sess.graph)
+                    global_step = 0
+
+                    self.write_context_lines(["apple banana unknown"])
+                    self.write_question_lines(["orange unknown"])
+                    self.write_answer_lines(["1 1"])
+
+                    for batch in get_batch_generator(
+                            self.word2id,
+                            self.char2id,
+                            self.context_file.name,
+                            self.question_file.name,
+                            self.answer_file.name,
+                            BATCH_SIZE,
+                            context_len=CONTEXT_LEN,
+                            question_len=QUESTION_LEN,
+                            word_len=WORD_LEN,
+                            discard_long=DISCARD_LONG):
+                        # Embedding matrix is of form VOCAB_SIZE X CHAR_EMBEDDING_SIZE (5 x 4)
+                        # [0,   1,  2,  3]
+                        # [4,   5,  6,  7]
+                        # [8,   9, 10, 11]
+                        # [12, 13, 14, 15]
+                        # [16, 17, 18, 19]
+                        expected_context_char_embs = [[[[ 8.,  9., 10., 11.], # 'a' ->  2
+                                                     [ 4.,  5.,  6.,  7.], # 'p' -> 'UNK' -> 1
+                                                     [ 4.,  5.,  6.,  7.], # 'p' -> 'UNK' -> 1
+                                                     [ 4.,  5.,  6.,  7.], # 'l' -> 'UNK' -> 1
+                                                     [ 4.,  5.,  6.,  7.], # 'e' -> 'UNK' -> 1
+                                                     [ 0.,  1.,  2.,  3.], # 'PAD' -> 0
+                                                     [ 0.,  1.,  2.,  3.]], # 'PAD' -> 0
+
+                                                    [[12., 13., 14., 15.], # b -> 3
+                                                     [ 8.,  9., 10., 11.], # a -> 2
+                                                     [ 4.,  5.,  6.,  7.], # n
+                                                     [ 8.,  9., 10., 11.], # a -> 2
+                                                     [ 4.,  5.,  6.,  7.], # n
+                                                     [ 8.,  9., 10., 11.], # a -> 2
+                                                     [ 0.,  1.,  2.,  3.]],# PAD
+
+                                                    [[ 4.,  5.,  6.,  7.], # u
+                                                     [ 4.,  5.,  6.,  7.], # n
+                                                     [ 4.,  5.,  6.,  7.], # k
+                                                     [ 4.,  5.,  6.,  7.], # n
+                                                     [ 4.,  5.,  6.,  7.], # o
+                                                     [ 4.,  5.,  6.,  7.], # w
+                                                     [ 4.,  5.,  6.,  7.]], # n
+
+                                                    [[ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.]]]] # PAD
+
+                        expected_qn_char_embs = [[[[ 4.,  5.,  6.,  7.], # O
+                                                 [ 4.,  5.,  6.,  7.], # R
+                                                 [ 8.,  9., 10., 11.], # A - > 2
+                                                 [ 4.,  5.,  6.,  7.], # N
+                                                 [ 4.,  5.,  6.,  7.], # G
+                                                 [ 4.,  5.,  6.,  7.], # E
+                                                 [ 0.,  1.,  2.,  3.]], # PAD
+
+                                                [[ 4.,  5.,  6.,  7.], # U
+                                                 [ 4.,  5.,  6.,  7.], # N
+                                                 [ 4.,  5.,  6.,  7.], # K
+                                                 [ 4.,  5.,  6.,  7.], # N
+                                                 [ 4.,  5.,  6.,  7.], # O
+                                                 [ 4.,  5.,  6.,  7.], # W
+                                                 [ 4.,  5.,  6.,  7.]], # N
+
+                                                [[ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.]]]] # PAD
+
+                        test_1 = tf.assert_equal(qa_model.context_char_embs, expected_context_char_embs)
+                        test_2 = tf.assert_equal(qa_model.qn_char_embs, expected_qn_char_embs)
+
+                        input_feed = qa_model.get_input_feed(batch, include_ans_span=True, apply_dropout=True)
+                        sess.run([test_1, test_2], input_feed)
+    
+    def test_char_embeddings_batch_size_two(self):
+        with tf.Graph().as_default():
+            NUM_FILTERS= 3
+            WINDOW_SIZE = 2
+            CONTEXT_LEN = 4
+            QUESTION_LEN = 3
+            WORD_LEN = 7
+            HIDDEN_SIZE = 3
+            MAX_GRADIENT_NORM = 5
+            LEARNING_RATE = .001
+            DROPOUT = 0.15
+            KEEP  = 1
+            flags = MyFlag(CONTEXT_LEN, QUESTION_LEN, WORD_LEN, HIDDEN_SIZE, MAX_GRADIENT_NORM, LEARNING_RATE, DROPOUT, KEEP, NUM_FILTERS, WINDOW_SIZE)
+
+            VOCAB_SIZE= 5
+            WORD_EMBEDDING_SIZE = 4
+            CHAR_EMBEDDING_SIZE = 4
+            emb_matrix = np.ones((VOCAB_SIZE, WORD_EMBEDDING_SIZE))
+
+            BATCH_SIZE = 2
+            DISCARD_LONG = True
+
+            qa_model = QAModel(flags, self.id2word, self.word2id, emb_matrix, self.id2char, self.char2id, CHAR_EMBEDDING_SIZE)
+            init = tf.global_variables_initializer()
+            with tf.Session() as sess:
+                sess.run(init)
+                with tempdir() as dirpath:
+                    summary_writer = tf.summary.FileWriter(dirpath, sess.graph)
+                    global_step = 0
+
+                    self.write_context_lines(["apple banana unknown", "apple"])
+                    self.write_question_lines(["orange unknown", "orange"])
+                    self.write_answer_lines(["1 1", "0 0"])
+        
+                    for batch in get_batch_generator(
+                            self.word2id,
+                            self.char2id,
+                            self.context_file.name,
+                            self.question_file.name,
+                            self.answer_file.name,
+                            BATCH_SIZE,
+                            context_len=CONTEXT_LEN,
+                            question_len=QUESTION_LEN,
+                            word_len=WORD_LEN,
+                            discard_long=DISCARD_LONG):
+                        # Embedding matrix is of form VOCAB_SIZE X CHAR_EMBEDDING_SIZE (5 x 4)
+                        # [0,   1,  2,  3]
+                        # [4,   5,  6,  7]
+                        # [8,   9, 10, 11]
+                        # [12, 13, 14, 15]
+                        # [16, 17, 18, 19]
+                        expected_context_char_embs = [[[[ 8.,  9., 10., 11.], # 'a' ->  2
+                                                     [ 4.,  5.,  6.,  7.], # 'p' -> 'UNK' -> 1
+                                                     [ 4.,  5.,  6.,  7.], # 'p' -> 'UNK' -> 1
+                                                     [ 4.,  5.,  6.,  7.], # 'l' -> 'UNK' -> 1
+                                                     [ 4.,  5.,  6.,  7.], # 'e' -> 'UNK' -> 1
+                                                     [ 0.,  1.,  2.,  3.], # 'PAD' -> 0
+                                                     [ 0.,  1.,  2.,  3.]], # 'PAD' -> 0
+
+                                                    [[ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.]],
+
+                                                    [[ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.]],
+
+                                                    [[ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.]]],#PAD
+
+                                                    [[[ 8.,  9., 10., 11.], # 'a' ->  2
+                                                     [ 4.,  5.,  6.,  7.], # 'p' -> 'UNK' -> 1
+                                                     [ 4.,  5.,  6.,  7.], # 'p' -> 'UNK' -> 1
+                                                     [ 4.,  5.,  6.,  7.], # 'l' -> 'UNK' -> 1
+                                                     [ 4.,  5.,  6.,  7.], # 'e' -> 'UNK' -> 1
+                                                     [ 0.,  1.,  2.,  3.], # 'PAD' -> 0
+                                                     [ 0.,  1.,  2.,  3.]], # 'PAD' -> 0
+
+                                                    [[12., 13., 14., 15.], # b -> 3
+                                                     [ 8.,  9., 10., 11.], # a -> 2
+                                                     [ 4.,  5.,  6.,  7.], # n
+                                                     [ 8.,  9., 10., 11.], # a -> 2
+                                                     [ 4.,  5.,  6.,  7.], # n
+                                                     [ 8.,  9., 10., 11.], # a -> 2
+                                                     [ 0.,  1.,  2.,  3.]],# PAD
+
+                                                    [[ 4.,  5.,  6.,  7.], # u
+                                                     [ 4.,  5.,  6.,  7.], # n
+                                                     [ 4.,  5.,  6.,  7.], # k
+                                                     [ 4.,  5.,  6.,  7.], # n
+                                                     [ 4.,  5.,  6.,  7.], # o
+                                                     [ 4.,  5.,  6.,  7.], # w
+                                                     [ 4.,  5.,  6.,  7.]], # n
+
+                                                    [[ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.], # PAD
+                                                     [ 0.,  1.,  2.,  3.]]]] #PAD
+
+                        expected_qn_char_embs = [[[[ 4.,  5.,  6.,  7.], # O
+                                                 [ 4.,  5.,  6.,  7.], # R
+                                                 [ 8.,  9., 10., 11.], # A - > 2
+                                                 [ 4.,  5.,  6.,  7.], # N
+                                                 [ 4.,  5.,  6.,  7.], # G
+                                                 [ 4.,  5.,  6.,  7.], # E
+                                                 [ 0.,  1.,  2.,  3.]], # PAD
+
+                                                [[ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.]],
+
+                                                [[ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.]]], #PAD
+
+                                                [[[ 4.,  5.,  6.,  7.], # O
+                                                 [ 4.,  5.,  6.,  7.], # R
+                                                 [ 8.,  9., 10., 11.], # A - > 2
+                                                 [ 4.,  5.,  6.,  7.], # N
+                                                 [ 4.,  5.,  6.,  7.], # G
+                                                 [ 4.,  5.,  6.,  7.], # E
+                                                 [ 0.,  1.,  2.,  3.]], # PAD
+
+                                                [[ 4.,  5.,  6.,  7.], # U
+                                                 [ 4.,  5.,  6.,  7.], # N
+                                                 [ 4.,  5.,  6.,  7.], # K
+                                                 [ 4.,  5.,  6.,  7.], # N
+                                                 [ 4.,  5.,  6.,  7.], # O
+                                                 [ 4.,  5.,  6.,  7.], # W
+                                                 [ 4.,  5.,  6.,  7.]], # N
+
+                                                [[ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.], # PAD
+                                                 [ 0.,  1.,  2.,  3.]]]] #PAD  
+                        
+                        test_1 = tf.assert_equal(qa_model.context_char_embs, expected_context_char_embs)
+                        test_2 = tf.assert_equal(qa_model.qn_char_embs, expected_qn_char_embs)
+
+                        input_feed = qa_model.get_input_feed(batch, include_ans_span=True, apply_dropout=True)
+                        sess.run([test_1, test_2], input_feed)
+                        # c, q  = sess.run([qa_model.context_char_embs, qa_model.qn_char_embs], input_feed)
+                        # print(c)
+                        # print(q)
+
+  
+    def test_prob_dist(self):
+        with tf.Graph().as_default():
+            NUM_FILTERS= 4
+            WINDOW_SIZE = 2
+            CONTEXT_LEN = 4
+            QUESTION_LEN = 3
+            WORD_LEN = 7
+            HIDDEN_SIZE = 3
+            MAX_GRADIENT_NORM = 5
+            LEARNING_RATE = .001
+            DROPOUT = 0.15
+            KEEP  = 1
+            flags = MyFlag(CONTEXT_LEN, QUESTION_LEN, WORD_LEN, HIDDEN_SIZE, MAX_GRADIENT_NORM, LEARNING_RATE, DROPOUT, KEEP, NUM_FILTERS, WINDOW_SIZE)
+
+            VOCAB_SIZE= 5
+            WORD_EMBEDDING_SIZE = 4
+            CHAR_EMBEDDING_SIZE = 4
+            emb_matrix = np.ones((VOCAB_SIZE, WORD_EMBEDDING_SIZE))
+
+            BATCH_SIZE = 1
+            DISCARD_LONG = True
+
+            qa_model = QAModel(flags, self.id2word, self.word2id, emb_matrix, self.id2char, self.char2id, CHAR_EMBEDDING_SIZE)
+
+            init = tf.global_variables_initializer()
+            with tf.Session() as sess:
+                sess.run(init)
+                with tempdir() as dirpath:
+                    summary_writer = tf.summary.FileWriter(dirpath, sess.graph)
+                    global_step = 0
+
+                    self.write_context_lines(["apple banana unknown"])
+                    self.write_question_lines(["orange unknown"])
+                    self.write_answer_lines(["1 1"])
+
+                    for batch in get_batch_generator(
+                            self.word2id,
+                            self.char2id,
+                            self.context_file.name,
+                            self.question_file.name,
+                            self.answer_file.name,
+                            BATCH_SIZE,
+                            context_len=CONTEXT_LEN,
+                            question_len=QUESTION_LEN,
+                            word_len=WORD_LEN,
+                            discard_long=DISCARD_LONG):
+                    
+                        # test_1 = tf.assert_equal(qa_model.context_char_embs, expected_context_char_embs)
+                        # test_2 = tf.assert_equal(qa_model.qn_char_embs, expected_qn_char_embs)
+                        summary_writer = tf.summary.FileWriter(tempdir(), sess.graph)
+                        
+                        input_feed = qa_model.get_input_feed(batch, include_ans_span=True, apply_dropout=True)
+                        prob_start, prob_end = sess.run([qa_model.probdist_start, qa_model.probdist_start], input_feed)
+                        print("prob_start:", prob_start)
+                        print("prob_end:", prob_end)
+
+    def test_run_train_iter(self):
+        with tf.Graph().as_default():
+            NUM_FILTERS= 4
+            WINDOW_SIZE = 2
+            CONTEXT_LEN = 4
+            QUESTION_LEN = 3
+            WORD_LEN = 7
+            HIDDEN_SIZE = 3
+            MAX_GRADIENT_NORM = 5
+            LEARNING_RATE = .001
+            DROPOUT = 0.15
+            KEEP  = 1
+            flags = MyFlag(CONTEXT_LEN, QUESTION_LEN, WORD_LEN, HIDDEN_SIZE, MAX_GRADIENT_NORM, LEARNING_RATE, DROPOUT, KEEP, NUM_FILTERS, WINDOW_SIZE)
+
+            VOCAB_SIZE= 5
+            WORD_EMBEDDING_SIZE = 4
+            CHAR_EMBEDDING_SIZE = 4
+            emb_matrix = np.ones((VOCAB_SIZE, WORD_EMBEDDING_SIZE))
+
+            BATCH_SIZE = 1
+            DISCARD_LONG = True
+
+            qa_model = QAModel(flags, self.id2word, self.word2id, emb_matrix, self.id2char, self.char2id, CHAR_EMBEDDING_SIZE)
+
+            init = tf.global_variables_initializer()
+            with tf.Session() as sess:
+                sess.run(init)
+                with tempdir() as dirpath:
+                    summary_writer = tf.summary.FileWriter(dirpath, sess.graph)
+                    global_step = 0
+
+                    self.write_context_lines(["apple banana unknown"])
+                    self.write_question_lines(["orange unknown"])
+                    self.write_answer_lines(["1 1"])
+
+                    for batch in get_batch_generator(
+                            self.word2id,
+                            self.char2id,
+                            self.context_file.name,
+                            self.question_file.name,
+                            self.answer_file.name,
+                            BATCH_SIZE,
+                            context_len=CONTEXT_LEN,
+                            question_len=QUESTION_LEN,
+                            word_len=WORD_LEN,
+                            discard_long=DISCARD_LONG):
+                    
+                        # test_1 = tf.assert_equal(qa_model.context_char_embs, expected_context_char_embs)
+                        # test_2 = tf.assert_equal(qa_model.qn_char_embs, expected_qn_char_embs)
+                        summary_writer = tf.summary.FileWriter(tempdir(), sess.graph)
+                        loss, global_step, param_norm, grad_norm = qa_model.run_train_iter(sess, batch, summary_writer, 0)
+                        print("loss: ", loss)
 
 
-
-
-# def main(unused_argv):
-#     run_tests()
-
-
-# if __name__ == "__main__":
-#     tf.app.run()
+if __name__ == "__main__":
+    unittest.main()
