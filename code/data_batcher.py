@@ -201,6 +201,7 @@ def refill_batches(batches, word2id, char2id, context_file, qn_file, ans_file, b
                 continue
             else: # truncate
                 qn_ids = qn_ids[:question_len]
+                qn_char_ids = qn_char_ids[:question_len]
 
         # discard or truncate too-long contexts
         if len(context_ids) > context_len:
@@ -208,17 +209,19 @@ def refill_batches(batches, word2id, char2id, context_file, qn_file, ans_file, b
                 continue
             else: # truncate
                 context_ids = context_ids[:context_len]
+                context_char_ids = context_char_ids[:context_len]
 
-        too_long_word = False
+
+        # too_long_word = False
         for i in range(len(context_char_ids)):
-            if context_char_ids[i] > word_len:
-                too_long_word = True
-                context_char_ids[i] = context_char_ids[i][:word_len]
+            # if len(context_char_ids[i]) > word_len:
+            # too_long_word = True
+            context_char_ids[i] = context_char_ids[i][:word_len]
 
         for i in range(len(qn_char_ids)):
-            if len(qn_char_ids[i]) > word_len:
-                too_long_word = True
-                qn_char_ids[i] = qn_char_ids[i][:word_len]
+            # if len(qn_char_ids[i]) > word_len:
+            # too_long_word = True
+            qn_char_ids[i] = qn_char_ids[i][:word_len]
         # if too_long_word and discard_long:
         #     continue
 
@@ -489,7 +492,7 @@ class TestGetBatchGenerator(unittest.TestCase):
                 question_len=question_len,
                 word_len=word_len,
                 discard_long=True):
-            assertEqual(batch.batch_size, 0)
+            self.assertEqual(batch.batch_size, 0)
 
     def test_too_long_question_word(self):
         """
@@ -517,7 +520,7 @@ class TestGetBatchGenerator(unittest.TestCase):
                 question_len=question_len,
                 word_len=word_len,
                 discard_long=True):
-            assertEqual(batch.batch_size, 0)
+            self.assertEqual(batch.batch_size, 0)
 
     def test_too_long_question_word_discard_long_false(self):
         """
@@ -529,8 +532,8 @@ class TestGetBatchGenerator(unittest.TestCase):
         word_len = 6
         discard_long = True
 
-        self.write_context_lines(["abc unknown"])
-        self.write_question_lines(["unknown abc"])
+        self.write_context_lines(["abc unknownfgdf"])
+        self.write_question_lines(["unknownfgdf abc"])
         self.write_answer_lines(["1 1"])
 
         for batch in get_batch_generator(
@@ -553,6 +556,38 @@ class TestGetBatchGenerator(unittest.TestCase):
                             [[[2, 1, 1, 0, 0, 0],
                               [1, 1, 1, 1, 1, 1], # unknown is truncated to six chars
                               [0, 0, 0, 0, 0, 0]]])
+    def test_too_long_word_and_sentence_discard_long_false(self):
+        """
+        If a word is too long in the context or question but discard_long is false, then truncate long word.
+        """
+        batch_size = 4
+        context_len = 1
+        question_len = 1
+        word_len = 6
+        discard_long = True
+
+        self.write_context_lines(["abc unknownfgdf"])
+        self.write_question_lines(["unknownfgdf abc"])
+        self.write_answer_lines(["1 1"])
+
+        for batch in get_batch_generator(
+                self.word2id,
+                self.char2id,
+                self.context_file.name,
+                self.question_file.name,
+                self.answer_file.name,
+                batch_size,
+                context_len=context_len,
+                question_len=question_len,
+                word_len=word_len,
+                discard_long=False):
+
+            self.assertEqual(batch.qn_char_ids.tolist(),
+                            [[[1, 1, 1, 1, 1, 1]]]) # unknown is truncated to six chars
+            self.assertEqual(batch.context_char_ids.tolist(),
+                            [[[2, 1, 1, 0, 0, 0]]])
+
+
 
 
 if __name__ == "__main__":
